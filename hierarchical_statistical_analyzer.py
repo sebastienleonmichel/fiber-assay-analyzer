@@ -18,7 +18,7 @@ Supports:
 
 Author: Sébastien Terreau
 Year: 2026
-Version: 2.2.9
+Version: 2.2.11
 """
 
 
@@ -38,7 +38,7 @@ import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
 
 
-APP_VERSION = "v2.2.9"
+APP_VERSION = "v2.2.11"
 
 
 # ============================================================
@@ -204,6 +204,16 @@ def run_column_residual_normality(df_wide):
 
         n_values = int(len(vals))
 
+        if n_values > 0:
+
+            mean_value = float(vals.mean())
+            median_value = float(vals.median())
+
+        else:
+
+            mean_value = np.nan
+            median_value = np.nan
+
         row = {
             "Analysis": "Residual normality",
             "Column": col,
@@ -213,7 +223,9 @@ def run_column_residual_normality(df_wide):
             "p_bonferroni": np.nan,
             "p_holm": np.nan,
             "p_fdr_bh": np.nan,
-            "Normality_decision": "not tested: n < 8"
+            "Normality_decision": "not tested: n < 8",
+            "Median": median_value,
+            "Mean": mean_value
         }
 
         if n_values >= 8:
@@ -371,6 +383,86 @@ def stratified_cliffs_delta(
     delta_B_minus_A = 1 - (2 * total_u_A / total_pairs)
 
     return float(delta_B_minus_A)
+
+
+
+
+def median_difference_from_values(values_A, values_B):
+    """
+    Compute median difference for a pairwise contrast.
+
+    Sign convention:
+        positive value -> group B median is higher than group A median
+        negative value -> group B median is lower than group A median
+    """
+
+    values_A = np.asarray(values_A, dtype=float)
+    values_B = np.asarray(values_B, dtype=float)
+
+    values_A = values_A[np.isfinite(values_A)]
+    values_B = values_B[np.isfinite(values_B)]
+
+    if len(values_A) == 0 or len(values_B) == 0:
+
+        return np.nan
+
+    return float(
+        np.median(values_B) - np.median(values_A)
+    )
+
+
+def stratified_median_difference(
+    df_long,
+    groupA,
+    groupB
+):
+    """
+    Compute a block-aware median difference for a pairwise contrast.
+
+    For each biological replicate/block, the median of group B is compared
+    with the median of group A. The reported value is the median of these
+    within-replicate differences.
+
+    Sign convention:
+        positive value -> group B tends to have a higher median than group A
+        negative value -> group B tends to have a lower median than group A
+    """
+
+    differences = []
+
+    for _, sub in df_long.groupby("replicate_id"):
+
+        sub = sub[
+            sub["group"].isin([groupA, groupB])
+        ]
+
+        values_A = sub.loc[
+            sub["group"] == groupA,
+            "value"
+        ].to_numpy(dtype=float)
+
+        values_B = sub.loc[
+            sub["group"] == groupB,
+            "value"
+        ].to_numpy(dtype=float)
+
+        values_A = values_A[np.isfinite(values_A)]
+        values_B = values_B[np.isfinite(values_B)]
+
+        if len(values_A) == 0 or len(values_B) == 0:
+            continue
+
+        differences.append(
+            np.median(values_B) - np.median(values_A)
+        )
+
+    if len(differences) == 0:
+
+        return np.nan
+
+    return float(
+        np.median(differences)
+    )
 
 
 def van_elteren_test(
@@ -649,6 +741,12 @@ def run_lmm(
             B
         )
 
+        median_diff = stratified_median_difference(
+            df,
+            A,
+            B
+        )
+
         # --------------------------------------------
         # REQUIRE MULTIPLE REPLICATES
         # --------------------------------------------
@@ -664,7 +762,10 @@ def run_lmm(
                     "LMM failed: <2 replicate levels",
 
                 "Cliffs_delta_B_minus_A":
-                    delta
+                    delta,
+
+                "Median_difference_B_minus_A":
+                    median_diff
 
             })
 
@@ -712,6 +813,9 @@ def run_lmm(
                 "Cliffs_delta_B_minus_A":
                     delta,
 
+                "Median_difference_B_minus_A":
+                    median_diff,
+
                 "p_raw":
                     pval
 
@@ -728,7 +832,10 @@ def run_lmm(
                     f"LMM failed: {e}",
 
                 "Cliffs_delta_B_minus_A":
-                    delta
+                    delta,
+
+                "Median_difference_B_minus_A":
+                    median_diff
 
             })
 
@@ -829,6 +936,11 @@ def run_fixed_block_lm(
             sub.loc[sub["group"] == B, "summary_value"]
         )
 
+        median_diff = median_difference_from_values(
+            sub.loc[sub["group"] == A, "summary_value"],
+            sub.loc[sub["group"] == B, "summary_value"]
+        )
+
         if sub["replicate_id"].nunique() < 2:
 
             rows.append({
@@ -841,6 +953,9 @@ def run_fixed_block_lm(
 
                 "Cliffs_delta_B_minus_A":
                     delta,
+
+                "Median_difference_B_minus_A":
+                    median_diff,
 
                 "Summary":
                     "replicate median",
@@ -886,6 +1001,9 @@ def run_fixed_block_lm(
                 "Cliffs_delta_B_minus_A":
                     delta,
 
+                "Median_difference_B_minus_A":
+                    median_diff,
+
                 "Summary":
                     "replicate median",
 
@@ -914,6 +1032,9 @@ def run_fixed_block_lm(
 
                 "Cliffs_delta_B_minus_A":
                     delta,
+
+                "Median_difference_B_minus_A":
+                    median_diff,
 
                 "Summary":
                     "replicate median",
@@ -1823,6 +1944,9 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                     "Cliffs_delta_B_minus_A":
                         np.nan,
 
+                    "Median_difference_B_minus_A":
+                        np.nan,
+
                     "p_raw":
                         global_p,
 
@@ -1861,6 +1985,12 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                         B
                     )
 
+                    median_diff = stratified_median_difference(
+                        df_long,
+                        A,
+                        B
+                    )
+
                     raw_p.append(p)
 
                     rows.append({
@@ -1873,6 +2003,9 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
                         "Cliffs_delta_B_minus_A":
                             delta,
+
+                        "Median_difference_B_minus_A":
+                            median_diff,
 
                         "p_raw":
                             p
@@ -1984,7 +2117,10 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                 "p_holm",
                 "p_fdr_bh",
                 "Normality_decision",
-                "Cliffs_delta_B_minus_A"
+                "Cliffs_delta_B_minus_A",
+                "Median_difference_B_minus_A",
+                "Median",
+                "Mean"
             ]
 
             for col in output_columns:
