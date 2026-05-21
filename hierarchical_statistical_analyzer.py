@@ -6,6 +6,7 @@ Hierarchical Statistical Analyzer
 GUI-based framework for:
 - stratified nonparametric testing
 - linear mixed-effects modeling
+- fixed-block linear modeling
 - replicate-aware statistical analysis
 - skewed biological datasets
 
@@ -17,10 +18,13 @@ Supports:
 
 Author: Sébastien Terreau
 Year: 2026
-Version: 2.1.1
+Version: 2.2.9
 """
 
 
+import time
+import threading
+import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -28,13 +32,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from scipy.stats import rankdata
+from scipy.stats import rankdata, normaltest
 
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
 
 
-APP_VERSION = "v2.1.1"
+APP_VERSION = "v2.2.9"
 
 
 # ============================================================
@@ -72,6 +76,189 @@ def reshape_long(df_wide, col_to_group, col_to_repl):
 
 
 # ============================================================
+# REPLICATE-LEVEL SUMMARY UTILITIES
+# ============================================================
+
+def add_multiple_testing_corrections(rows, raw_p):
+    """
+    Add Bonferroni, Holm, and Benjamini-Hochberg FDR-adjusted
+    p-values to a list of result rows.
+    """
+
+    raw_p_array = np.array(raw_p)
+
+    valid = np.isfinite(raw_p_array)
+
+    holm_adj = np.full(len(raw_p), np.nan)
+    bonf_adj = np.full(len(raw_p), np.nan)
+    fdr_adj = np.full(len(raw_p), np.nan)
+
+    if np.sum(valid) > 0:
+
+        _, p_holm, _, _ = multipletests(
+            raw_p_array[valid],
+            method="holm"
+        )
+
+        _, p_bonf, _, _ = multipletests(
+            raw_p_array[valid],
+            method="bonferroni"
+        )
+
+        _, p_fdr, _, _ = multipletests(
+            raw_p_array[valid],
+            method="fdr_bh"
+        )
+
+        holm_adj[valid] = p_holm
+        bonf_adj[valid] = p_bonf
+        fdr_adj[valid] = p_fdr
+
+    for i in range(len(rows)):
+
+        rows[i]["p_bonferroni"] = bonf_adj[i]
+        rows[i]["p_holm"] = holm_adj[i]
+        rows[i]["p_fdr_bh"] = fdr_adj[i]
+
+    return rows
+
+
+def summarize_replicate_medians(
+    df_long,
+    log_transform=False
+):
+    """
+    Collapse cell-level values into one median value per
+    group per biological replicate.
+
+    This avoids treating thousands of cells as independent
+    biological replicates when running replicate-level tests.
+    """
+
+    df = df_long.copy()
+
+    if log_transform:
+
+        df["response"] = np.log(df["value"])
+
+    else:
+
+        df["response"] = df["value"]
+
+    summary = (
+        df.groupby(
+            ["replicate_id", "group"],
+            as_index=False
+        )["response"]
+        .median()
+        .rename(columns={"response": "summary_value"})
+    )
+
+    return summary
+
+
+
+def simplify_output_columns(results):
+    """
+    Keep the output table focused on contrast, method, effect size, and p-values.
+    """
+
+    columns_to_drop = [
+        "Summary",
+        "n_replicates",
+        "statistic",
+        "coefficient_B_minus_A"
+    ]
+
+    return results.drop(
+        columns=[
+            col for col in columns_to_drop
+            if col in results.columns
+        ]
+    )
+
+
+def run_column_residual_normality(df_wide):
+    """
+    Run D'Agostino-Pearson omnibus normality tests on residuals
+    from an intercept-only model for each original input column.
+
+    For each column:
+        residual = value - column mean
+
+    Decision threshold:
+        p < 0.05 -> non-normal residuals
+    """
+
+    rows = []
+
+    for col in df_wide.columns:
+
+        vals = pd.to_numeric(
+            df_wide[col],
+            errors="coerce"
+        ).dropna()
+
+        # Keep this consistent with the analyzer's main reshape step.
+        vals = vals[vals > 0]
+
+        n_values = int(len(vals))
+
+        row = {
+            "Analysis": "Residual normality",
+            "Column": col,
+            "Contrast": "",
+            "Method": "D'Agostino-Pearson omnibus normality test",
+            "p_raw": np.nan,
+            "p_bonferroni": np.nan,
+            "p_holm": np.nan,
+            "p_fdr_bh": np.nan,
+            "Normality_decision": "not tested: n < 8"
+        }
+
+        if n_values >= 8:
+
+            residuals = vals.to_numpy(dtype=float) - float(vals.mean())
+
+            try:
+
+                _, pval = normaltest(
+                    residuals,
+                    nan_policy="omit"
+                )
+
+                pval = float(pval)
+
+                row["p_raw"] = pval
+
+                if np.isfinite(pval):
+
+                    if pval < 0.05:
+
+                        row["Normality_decision"] = (
+                            "non-normal residuals"
+                        )
+
+                    else:
+
+                        row["Normality_decision"] = (
+                            "no evidence of non-normal residuals"
+                        )
+
+                else:
+
+                    row["Normality_decision"] = "not tested: invalid p-value"
+
+            except Exception as e:
+
+                row["Normality_decision"] = f"normality test failed: {e}"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
 # WILCOXON UTILITIES
 # ============================================================
 
@@ -86,17 +273,135 @@ def mannwhitney_u(x, gA_mask):
     return float(U)
 
 
+def cliffs_delta_from_values(values_A, values_B):
+    """
+    Compute Cliff's delta for two independent sets of values.
+
+    Sign convention:
+        positive delta -> group B tends to have higher values than group A
+        negative delta -> group B tends to have lower values than group A
+
+    Ties contribute 0 to the effect size.
+    """
+
+    values_A = np.asarray(values_A, dtype=float)
+    values_B = np.asarray(values_B, dtype=float)
+
+    values_A = values_A[np.isfinite(values_A)]
+    values_B = values_B[np.isfinite(values_B)]
+
+    nA = len(values_A)
+    nB = len(values_B)
+
+    if nA == 0 or nB == 0:
+
+        return np.nan
+
+    values = np.concatenate([values_A, values_B])
+
+    gA_mask = np.concatenate([
+        np.ones(nA, dtype=bool),
+        np.zeros(nB, dtype=bool)
+    ])
+
+    u_A = mannwhitney_u(
+        values,
+        gA_mask
+    )
+
+    # U_A estimates P(A > B) + 0.5 * P(A = B).
+    # Cliff's delta for B minus A is the opposite direction:
+    # P(B > A) - P(B < A).
+    delta_B_minus_A = 1 - (2 * u_A / (nA * nB))
+
+    return float(delta_B_minus_A)
+
+
+def stratified_cliffs_delta(
+    df_long,
+    groupA,
+    groupB
+):
+    """
+    Compute a block-aware Cliff's delta for a pairwise contrast.
+
+    The effect size is calculated within each biological replicate/block
+    and combined by weighting each block by the number of possible A-B
+    pairs. Cross-replicate comparisons are not made.
+
+    Sign convention:
+        positive delta -> group B tends to be higher than group A
+        negative delta -> group B tends to be lower than group A
+    """
+
+    total_u_A = 0.0
+    total_pairs = 0
+
+    for _, sub in df_long.groupby("replicate_id"):
+
+        sub = sub[
+            sub["group"].isin([groupA, groupB])
+        ]
+
+        if len(sub) == 0:
+            continue
+
+        values = sub["value"].to_numpy(dtype=float)
+        labels = sub["group"].to_numpy()
+
+        gA_mask = labels == groupA
+
+        nA = int(gA_mask.sum())
+        nB = int((labels == groupB).sum())
+
+        if nA == 0 or nB == 0:
+            continue
+
+        total_u_A += mannwhitney_u(
+            values,
+            gA_mask
+        )
+
+        total_pairs += nA * nB
+
+    if total_pairs == 0:
+
+        return np.nan
+
+    delta_B_minus_A = 1 - (2 * total_u_A / total_pairs)
+
+    return float(delta_B_minus_A)
+
+
 def van_elteren_test(
     df_long,
     groupA,
     groupB,
     n_perm=10000,
-    seed=0
+    seed=0,
+    progress_callback=None,
+    progress_update_interval=None
 ):
+    """
+    Stratified Wilcoxon / van Elteren-style permutation test.
+
+    progress_callback, when provided, is called periodically during
+    permutations so the GUI can refresh elapsed time/status while the
+    analysis is running.
+    """
 
     rng = np.random.default_rng(seed)
 
+    if progress_update_interval is None:
+
+        progress_update_interval = max(
+            1,
+            n_perm // 100
+        )
+
     observed = 0.0
+
+    replicate_subsets = []
 
     for _, sub in df_long.groupby("replicate_id"):
 
@@ -109,35 +414,28 @@ def van_elteren_test(
 
         x = sub["value"].to_numpy()
 
-        gA = (
-            sub["group"].to_numpy() == groupA
-        )
+        groups = sub["group"].to_numpy()
+
+        gA = groups == groupA
 
         if gA.sum() == 0:
             continue
 
         observed += mannwhitney_u(x, gA)
 
+        replicate_subsets.append(
+            (x, int(gA.sum()))
+        )
+
     perms = []
 
-    for _ in range(n_perm):
+    last_progress_report = 0
+
+    for perm_index in range(n_perm):
 
         total = 0.0
 
-        for _, sub in df_long.groupby("replicate_id"):
-
-            sub = sub[
-                sub["group"].isin([groupA, groupB])
-            ]
-
-            if len(sub) == 0:
-                continue
-
-            x = sub["value"].to_numpy()
-
-            nA = np.sum(
-                sub["group"].to_numpy() == groupA
-            )
+        for x, nA in replicate_subsets:
 
             idx = np.arange(len(x))
 
@@ -154,6 +452,21 @@ def van_elteren_test(
 
         perms.append(total)
 
+        if progress_callback is not None:
+
+            completed = perm_index + 1
+
+            if (
+                completed % progress_update_interval == 0
+                or completed == n_perm
+            ):
+
+                progress_callback(
+                    completed - last_progress_report
+                )
+
+                last_progress_report = completed
+
     perms = np.array(perms)
 
     center = perms.mean()
@@ -166,6 +479,138 @@ def van_elteren_test(
     ) / (n_perm + 1)
 
     return observed, p
+
+
+
+def kruskal_h_from_ranks(
+    ranks,
+    labels,
+    group_names
+):
+    """
+    Compute a Kruskal-Wallis-style H statistic from precomputed ranks.
+
+    Ranks are computed within one replicate/block. The statistic is used
+    as the block-level component of the global stratified rank test.
+    """
+
+    n_total = len(ranks)
+
+    if n_total == 0:
+
+        return 0.0
+
+    group_terms = 0.0
+    n_groups_present = 0
+
+    for group_name in group_names:
+
+        mask = labels == group_name
+        n_group = int(mask.sum())
+
+        if n_group == 0:
+
+            continue
+
+        mean_rank = float(ranks[mask].mean())
+
+        group_terms += n_group * (
+            mean_rank - (n_total + 1) / 2
+        ) ** 2
+
+        n_groups_present += 1
+
+    if n_groups_present < 2:
+
+        return 0.0
+
+    h_stat = (
+        12 / (n_total * (n_total + 1))
+    ) * group_terms
+
+    return float(h_stat)
+
+
+def global_stratified_rank_test(
+    df_long,
+    groups,
+    n_perm=10000,
+    seed=0
+):
+    """
+    Omnibus stratified rank permutation test across all selected groups.
+
+    The statistic is the sum of Kruskal-Wallis-style rank statistics
+    calculated within each biological replicate/block. During permutation,
+    group labels are shuffled within each replicate, preserving the
+    original number of observations per group within that replicate.
+
+    This provides a global screen before post hoc pairwise stratified
+    Wilcoxon tests.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    groups = list(groups)
+
+    replicate_subsets = []
+    observed = 0.0
+
+    for _, sub in df_long.groupby("replicate_id"):
+
+        sub = sub[
+            sub["group"].isin(groups)
+        ].copy()
+
+        if sub["group"].nunique() < 2:
+
+            continue
+
+        values = sub["value"].to_numpy(dtype=float)
+        labels = sub["group"].to_numpy()
+        ranks = rankdata(values, method="average")
+
+        observed += kruskal_h_from_ranks(
+            ranks,
+            labels,
+            groups
+        )
+
+        replicate_subsets.append(
+            (ranks, labels.copy())
+        )
+
+    if len(replicate_subsets) == 0:
+
+        return np.nan, np.nan
+
+    perms = []
+
+    for _ in range(n_perm):
+
+        total = 0.0
+
+        for ranks, labels in replicate_subsets:
+
+            permuted_labels = labels.copy()
+
+            rng.shuffle(permuted_labels)
+
+            total += kruskal_h_from_ranks(
+                ranks,
+                permuted_labels,
+                groups
+            )
+
+        perms.append(total)
+
+    perms = np.array(perms)
+
+    p = (
+        np.sum(perms >= observed) + 1
+    ) / (n_perm + 1)
+
+    return observed, float(p)
 
 
 # ============================================================
@@ -198,6 +643,12 @@ def run_lmm(
             df["group"].isin([A, B])
         ].copy()
 
+        delta = stratified_cliffs_delta(
+            df,
+            A,
+            B
+        )
+
         # --------------------------------------------
         # REQUIRE MULTIPLE REPLICATES
         # --------------------------------------------
@@ -210,7 +661,10 @@ def run_lmm(
                     f"{A} vs {B}",
 
                 "Method":
-                    "LMM failed: <2 replicate levels"
+                    "LMM failed: <2 replicate levels",
+
+                "Cliffs_delta_B_minus_A":
+                    delta
 
             })
 
@@ -255,6 +709,8 @@ def run_lmm(
                 "Method":
                     "Linear Mixed Model",
 
+                "Cliffs_delta_B_minus_A":
+                    delta,
 
                 "p_raw":
                     pval
@@ -269,7 +725,10 @@ def run_lmm(
                     f"{A} vs {B}",
 
                 "Method":
-                    f"LMM failed: {e}"
+                    f"LMM failed: {e}",
+
+                "Cliffs_delta_B_minus_A":
+                    delta
 
             })
 
@@ -313,6 +772,163 @@ def run_lmm(
         rows[i]["p_bonferroni"] = bonf_adj[i]
         rows[i]["p_holm"] = holm_adj[i]
         rows[i]["p_fdr_bh"] = fdr_adj[i]
+
+    return pd.DataFrame(rows)
+
+
+
+# ============================================================
+# FIXED-BLOCK LINEAR MODEL ON REPLICATE MEDIANS
+# ============================================================
+
+def run_fixed_block_lm(
+    df_long,
+    contrasts,
+    log_transform=False
+):
+    """
+    Run a fixed-block linear model on replicate-level medians.
+
+    Model for each pairwise contrast:
+        summary_value ~ group_code + C(replicate_id)
+
+    Here replicate_id is treated as a fixed blocking factor
+    instead of a random effect.
+    """
+
+    summary = summarize_replicate_medians(
+        df_long,
+        log_transform=log_transform
+    )
+
+    rows = []
+
+    raw_p = []
+
+    for A, B in contrasts:
+
+        sub = summary[
+            summary["group"].isin([A, B])
+        ].copy()
+
+        complete_replicates = (
+            sub.groupby("replicate_id")["group"]
+            .nunique()
+        )
+
+        complete_replicates = complete_replicates[
+            complete_replicates == 2
+        ].index
+
+        sub = sub[
+            sub["replicate_id"].isin(complete_replicates)
+        ].copy()
+
+        delta = cliffs_delta_from_values(
+            sub.loc[sub["group"] == A, "summary_value"],
+            sub.loc[sub["group"] == B, "summary_value"]
+        )
+
+        if sub["replicate_id"].nunique() < 2:
+
+            rows.append({
+
+                "Contrast":
+                    f"{A} vs {B}",
+
+                "Method":
+                    "Fixed-block LM failed: <2 complete replicate blocks",
+
+                "Cliffs_delta_B_minus_A":
+                    delta,
+
+                "Summary":
+                    "replicate median",
+
+                "n_replicates":
+                    sub["replicate_id"].nunique()
+
+            })
+
+            raw_p.append(np.nan)
+
+            continue
+
+        sub["group_code"] = (
+            sub["group"] == B
+        ).astype(int)
+
+        try:
+
+            model = smf.ols(
+                "summary_value ~ group_code + C(replicate_id)",
+                data=sub
+            )
+
+            fit = model.fit()
+
+            beta = float(
+                fit.params["group_code"]
+            )
+
+            pval = float(
+                fit.pvalues["group_code"]
+            )
+
+            rows.append({
+
+                "Contrast":
+                    f"{A} vs {B}",
+
+                "Method":
+                    "Fixed-block linear model",
+
+                "Cliffs_delta_B_minus_A":
+                    delta,
+
+                "Summary":
+                    "replicate median",
+
+                "n_replicates":
+                    sub["replicate_id"].nunique(),
+
+                "coefficient_B_minus_A":
+                    beta,
+
+                "p_raw":
+                    pval
+
+            })
+
+            raw_p.append(pval)
+
+        except Exception as e:
+
+            rows.append({
+
+                "Contrast":
+                    f"{A} vs {B}",
+
+                "Method":
+                    f"Fixed-block LM failed: {e}",
+
+                "Cliffs_delta_B_minus_A":
+                    delta,
+
+                "Summary":
+                    "replicate median",
+
+                "n_replicates":
+                    sub["replicate_id"].nunique()
+
+            })
+
+            raw_p.append(np.nan)
+
+    rows = add_multiple_testing_corrections(
+        rows,
+        raw_p
+    )
 
     return pd.DataFrame(rows)
 
@@ -470,6 +1086,28 @@ class ScrollableFrame(ttk.Frame):
 
 
 # ============================================================
+# TIMER UTILITIES
+# ============================================================
+
+def format_elapsed_time(seconds):
+    """
+    Format elapsed time as HH:MM:SS for the GUI timer.
+    """
+
+    seconds = int(max(0, seconds))
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    return f"{minutes:02d}:{secs:02d}"
+
+
+# ============================================================
 # GUI
 # ============================================================
 
@@ -492,13 +1130,29 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
         self.repl_vars = {}
         self.contrast_vars = {}
 
-        self.engine_var = tk.StringVar(
-            value="Both"
-        )
+        self.engine_vars = {
+            "Stratified Wilcoxon": tk.BooleanVar(value=True),
+            "Linear Mixed Model": tk.BooleanVar(value=True),
+            "Fixed-block linear model": tk.BooleanVar(value=False)
+        }
 
         self.log_var = tk.BooleanVar(
             value=False
         )
+
+        self.status_var = tk.StringVar(
+            value="Ready"
+        )
+
+        self.elapsed_var = tk.StringVar(
+            value="Elapsed time: 00:00"
+        )
+
+        self.analysis_start_time = None
+        self.last_timer_update = 0
+        self.timer_job = None
+        self.worker_queue = queue.Queue()
+        self.analysis_thread = None
 
         self._build_gui()
 
@@ -770,33 +1424,83 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
         ttk.Label(
             frm,
-            text="Statistical engine"
-        ).pack(anchor="w", padx=20, pady=10)
+            text="Statistical engines"
+        ).pack(anchor="w", padx=20, pady=(20, 5))
 
-        ttk.Combobox(
+        ttk.Label(
             frm,
-            textvariable=self.engine_var,
-            values=[
-                "Stratified Wilcoxon",
-                "Linear Mixed Model",
-                "Both"
-            ],
-            state="readonly"
-        ).pack(anchor="w", padx=20)
+            text="Select one or multiple tests to run at the same time."
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        for engine_name, engine_var in self.engine_vars.items():
+
+            ttk.Checkbutton(
+                frm,
+                text=engine_name,
+                variable=engine_var
+            ).pack(anchor="w", padx=40, pady=2)
+
+        ttk.Separator(
+            frm,
+            orient="horizontal"
+        ).pack(fill="x", padx=20, pady=20)
 
         ttk.Checkbutton(
             frm,
             text="Log-transform values",
             variable=self.log_var
-        ).pack(anchor="w", padx=20, pady=20)
+        ).pack(anchor="w", padx=20, pady=5)
+
 
     def build_run(self):
 
-        ttk.Button(
-            self.tab_run,
+        control_frame = ttk.Frame(
+            self.tab_run
+        )
+
+        control_frame.pack(
+            fill="x",
+            padx=20,
+            pady=(20, 10)
+        )
+
+        self.run_button = ttk.Button(
+            control_frame,
             text="Run Analysis",
             command=self.run_analysis
-        ).pack(anchor="w", padx=20, pady=20)
+        )
+
+        self.run_button.pack(
+            anchor="w",
+            pady=(0, 10)
+        )
+
+        ttk.Label(
+            control_frame,
+            textvariable=self.status_var
+        ).pack(
+            anchor="w",
+            pady=(0, 5)
+        )
+
+        ttk.Label(
+            control_frame,
+            textvariable=self.elapsed_var
+        ).pack(
+            anchor="w",
+            pady=(0, 5)
+        )
+
+        self.progress_bar = ttk.Progressbar(
+            control_frame,
+            mode="indeterminate",
+            length=500
+        )
+
+        self.progress_bar.pack(
+            anchor="w",
+            fill="x"
+        )
 
         output_frame = ttk.Frame(
             self.tab_run
@@ -862,6 +1566,14 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
         )
 
     def run_analysis(self):
+        """
+        Validate GUI input and start the statistical analysis in a
+        background thread.
+
+        Tkinter can only refresh labels, progress bars, and timers while
+        its main event loop is free. Long permutation tests therefore need
+        to run outside the main GUI thread.
+        """
 
         if self.df is None:
 
@@ -900,12 +1612,6 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
             return
 
-        df_long = reshape_long(
-            self.df,
-            col_to_group,
-            col_to_repl
-        )
-
         contrasts = []
 
         current_groups = set(col_to_group.values())
@@ -934,122 +1640,446 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
             return
 
-        all_results = []
+        selected_engines = [
+            engine_name
+            for engine_name, engine_var in self.engine_vars.items()
+            if engine_var.get()
+        ]
 
-        engine = self.engine_var.get()
+        if not selected_engines:
 
-        # ====================================================
-        # STRATIFIED WILCOXON
-        # ====================================================
+            messagebox.showerror(
+                "No statistical engine selected",
+                "Please select at least one statistical engine before running the analysis."
+            )
 
-        if engine in [
-            "Stratified Wilcoxon",
-            "Both"
-        ]:
+            return
 
-            rows = []
+        # Clear any old messages left in the queue.
+        while not self.worker_queue.empty():
 
-            raw_p = []
+            try:
 
-            for A, B in contrasts:
+                self.worker_queue.get_nowait()
 
-                U, p = van_elteren_test(
+            except queue.Empty:
+
+                break
+
+        self.analysis_start_time = time.monotonic()
+        self.last_timer_update = 0
+
+        self.status_var.set(
+            "Preparing analysis..."
+        )
+
+        self.elapsed_var.set(
+            "Elapsed time: 00:00"
+        )
+
+        self.output.delete("1.0", tk.END)
+
+        self.run_button.configure(
+            state="disabled"
+        )
+
+        self.progress_bar.start(15)
+        self._schedule_elapsed_timer()
+
+        # Copy the dataframe before moving into the worker thread.
+        # This keeps the background analysis isolated from GUI state.
+        df_copy = self.df.copy()
+        input_path = self.input_path
+        log_transform = self.log_var.get()
+
+        self.analysis_thread = threading.Thread(
+            target=self._analysis_worker,
+            kwargs={
+                "df_wide": df_copy,
+                "col_to_group": col_to_group,
+                "col_to_repl": col_to_repl,
+                "contrasts": contrasts,
+                "selected_engines": selected_engines,
+                "log_transform": log_transform,
+                "input_path": input_path,
+            },
+            daemon=True
+        )
+
+        self.analysis_thread.start()
+        self.after(100, self._poll_worker_queue)
+
+    def _schedule_elapsed_timer(self):
+        """
+        Update the elapsed-time label from the Tkinter main thread.
+        This keeps moving while the analysis runs in a worker thread.
+        """
+
+        if self.analysis_start_time is None:
+
+            return
+
+        elapsed = time.monotonic() - self.analysis_start_time
+
+        self.elapsed_var.set(
+            f"Elapsed time: {format_elapsed_time(elapsed)}"
+        )
+
+        self.timer_job = self.after(
+            500,
+            self._schedule_elapsed_timer
+        )
+
+    def _stop_elapsed_timer(self):
+        """
+        Stop the scheduled timer callback safely.
+        """
+
+        if self.timer_job is not None:
+
+            self.after_cancel(
+                self.timer_job
+            )
+
+            self.timer_job = None
+
+        if self.analysis_start_time is not None:
+
+            elapsed = time.monotonic() - self.analysis_start_time
+
+            self.elapsed_var.set(
+                f"Elapsed time: {format_elapsed_time(elapsed)}"
+            )
+
+    def _analysis_worker(
+        self,
+        df_wide,
+        col_to_group,
+        col_to_repl,
+        contrasts,
+        selected_engines,
+        log_transform,
+        input_path
+    ):
+        """
+        Run the statistics outside the Tkinter main thread.
+
+        This method must not directly modify Tkinter widgets. It sends
+        status/results/errors back to the main thread through worker_queue.
+        """
+
+        try:
+
+            n_perm = 10000
+
+            self.worker_queue.put((
+                "status",
+                "Reshaping data..."
+            ))
+
+            df_long = reshape_long(
+                df_wide,
+                col_to_group,
+                col_to_repl
+            )
+
+            all_results = []
+
+            # ====================================================
+            # STRATIFIED WILCOXON
+            # ====================================================
+
+            if "Stratified Wilcoxon" in selected_engines:
+
+                rows = []
+
+                raw_p = []
+
+                selected_groups = sorted({
+                    group
+                    for contrast in contrasts
+                    for group in contrast
+                })
+
+                self.worker_queue.put((
+                    "status",
+                    "Running global stratified rank test..."
+                ))
+
+                global_stat, global_p = global_stratified_rank_test(
                     df_long,
-                    A,
-                    B
+                    selected_groups,
+                    n_perm=n_perm
                 )
-
-                raw_p.append(p)
 
                 rows.append({
 
                     "Contrast":
-                        f"{A} vs {B}",
+                        "Global",
 
                     "Method":
-                        "Stratified Wilcoxon",
+                        "Global stratified rank test",
+
+                    "Cliffs_delta_B_minus_A":
+                        np.nan,
 
                     "p_raw":
-                        p
+                        global_p,
+
+                    "p_bonferroni":
+                        np.nan,
+
+                    "p_holm":
+                        np.nan,
+
+                    "p_fdr_bh":
+                        np.nan
 
                 })
 
-            raw_p_array = np.array(raw_p)
+                for contrast_index, (A, B) in enumerate(
+                    contrasts,
+                    start=1
+                ):
 
-            valid = np.isfinite(raw_p_array)
+                    self.worker_queue.put((
+                        "status",
+                        f"Running Stratified Wilcoxon: {A} vs {B} "
+                        f"({contrast_index}/{len(contrasts)})"
+                    ))
 
-            holm_adj = np.full(len(raw_p), np.nan)
-            bonf_adj = np.full(len(raw_p), np.nan)
-            fdr_adj = np.full(len(raw_p), np.nan)
+                    U, p = van_elteren_test(
+                        df_long,
+                        A,
+                        B,
+                        n_perm=n_perm
+                    )
 
-            if np.sum(valid) > 0:
+                    delta = stratified_cliffs_delta(
+                        df_long,
+                        A,
+                        B
+                    )
 
-                _, p_holm, _, _ = multipletests(
-                    raw_p_array[valid],
-                    method="holm"
+                    raw_p.append(p)
+
+                    rows.append({
+
+                        "Contrast":
+                            f"{A} vs {B}",
+
+                        "Method":
+                            "Stratified Wilcoxon",
+
+                        "Cliffs_delta_B_minus_A":
+                            delta,
+
+                        "p_raw":
+                            p
+
+                    })
+
+                posthoc_rows = rows[1:]
+
+                posthoc_rows = add_multiple_testing_corrections(
+                    posthoc_rows,
+                    raw_p
                 )
 
-                _, p_bonf, _, _ = multipletests(
-                    raw_p_array[valid],
-                    method="bonferroni"
+                rows = [
+                    rows[0]
+                ] + posthoc_rows
+
+                wilcox_df = pd.DataFrame(rows)
+
+                all_results.append(wilcox_df)
+
+            # ====================================================
+            # LMM
+            # ====================================================
+
+            if "Linear Mixed Model" in selected_engines:
+
+                self.worker_queue.put((
+                    "status",
+                    "Running Linear Mixed Model..."
+                ))
+
+                lmm_df = run_lmm(
+                    df_long,
+                    contrasts,
+                    log_transform=log_transform
                 )
 
-                _, p_fdr, _, _ = multipletests(
-                    raw_p_array[valid],
-                    method="fdr_bh"
+                all_results.append(lmm_df)
+
+            # ====================================================
+            # FIXED-BLOCK LINEAR MODEL
+            # ====================================================
+
+            if "Fixed-block linear model" in selected_engines:
+
+                self.worker_queue.put((
+                    "status",
+                    "Running Fixed-block linear model..."
+                ))
+
+                fixed_block_df = run_fixed_block_lm(
+                    df_long,
+                    contrasts,
+                    log_transform=log_transform
                 )
 
-                holm_adj[valid] = p_holm
-                bonf_adj[valid] = p_bonf
-                fdr_adj[valid] = p_fdr
+                all_results.append(fixed_block_df)
 
-            for i in range(len(rows)):
-
-                rows[i]["p_bonferroni"] = bonf_adj[i]
-                rows[i]["p_holm"] = holm_adj[i]
-                rows[i]["p_fdr_bh"] = fdr_adj[i]
-
-            wilcox_df = pd.DataFrame(rows)
-
-            all_results.append(wilcox_df)
-
-        # ====================================================
-        # LMM
-        # ====================================================
-
-        if engine in [
-            "Linear Mixed Model",
-            "Both"
-        ]:
-
-            lmm_df = run_lmm(
-                df_long,
-                contrasts,
-                log_transform=self.log_var.get()
+            results = pd.concat(
+                all_results,
+                ignore_index=True
             )
 
-            all_results.append(lmm_df)
+            results = simplify_output_columns(results)
 
-        results = pd.concat(
-            all_results,
-            ignore_index=True
-        )
-
-        if self.input_path is not None:
-
-            output_path = (
-                self.input_path.parent
-                / f"{self.input_path.stem}_statistical-analysis.csv"
+            results.insert(
+                0,
+                "Analysis",
+                "Contrast test"
             )
 
-        else:
+            if "Column" not in results.columns:
 
-            output_path = Path("statistical-analysis.csv")
+                results.insert(
+                    1,
+                    "Column",
+                    ""
+                )
 
-        results.to_csv(
-            output_path,
-            index=False
-        )
+            if "Normality_decision" not in results.columns:
+
+                results["Normality_decision"] = ""
+
+            self.worker_queue.put((
+                "status",
+                "Running residual normality tests..."
+            ))
+
+            normality_df = run_column_residual_normality(
+                df_wide
+            )
+
+            results = pd.concat(
+                [
+                    results,
+                    normality_df
+                ],
+                ignore_index=True
+            )
+
+            output_columns = [
+                "Analysis",
+                "Column",
+                "Contrast",
+                "Method",
+                "p_raw",
+                "p_bonferroni",
+                "p_holm",
+                "p_fdr_bh",
+                "Normality_decision",
+                "Cliffs_delta_B_minus_A"
+            ]
+
+            for col in output_columns:
+
+                if col not in results.columns:
+
+                    results[col] = np.nan
+
+            results = results[output_columns]
+
+            if input_path is not None:
+
+                output_path = (
+                    input_path.parent
+                    / f"{input_path.stem}_statistical-analysis.csv"
+                )
+
+            else:
+
+                output_path = Path("statistical-analysis.csv")
+
+            results.to_csv(
+                output_path,
+                index=False
+            )
+
+            self.worker_queue.put((
+                "done",
+                results,
+                output_path
+            ))
+
+        except Exception as e:
+
+            self.worker_queue.put((
+                "error",
+                str(e)
+            ))
+
+    def _poll_worker_queue(self):
+        """
+        Receive worker-thread status/results/errors and update the GUI
+        from the main Tkinter thread.
+        """
+
+        try:
+
+            while True:
+
+                message = self.worker_queue.get_nowait()
+
+                message_type = message[0]
+
+                if message_type == "status":
+
+                    self.status_var.set(
+                        message[1]
+                    )
+
+                elif message_type == "done":
+
+                    _, results, output_path = message
+
+                    self._finish_successful_analysis(
+                        results,
+                        output_path
+                    )
+
+                    return
+
+                elif message_type == "error":
+
+                    self._finish_failed_analysis(
+                        message[1]
+                    )
+
+                    return
+
+        except queue.Empty:
+
+            pass
+
+        self.after(100, self._poll_worker_queue)
+
+    def _finish_successful_analysis(
+        self,
+        results,
+        output_path
+    ):
+        """
+        Final GUI update after successful analysis.
+        """
+
+        self._stop_elapsed_timer()
+        self.progress_bar.stop()
 
         self.output.delete("1.0", tk.END)
 
@@ -1058,10 +2088,46 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
             results.to_string(index=False)
         )
 
+        self.status_var.set(
+            "Analysis completed."
+        )
+
+        self.run_button.configure(
+            state="normal"
+        )
+
         messagebox.showinfo(
             "Done",
             f"Analysis completed. Results saved as:\n{output_path}"
         )
+
+        self.analysis_start_time = None
+
+    def _finish_failed_analysis(
+        self,
+        error_message
+    ):
+        """
+        Final GUI update after failed analysis.
+        """
+
+        self._stop_elapsed_timer()
+        self.progress_bar.stop()
+
+        self.status_var.set(
+            "Analysis failed."
+        )
+
+        self.run_button.configure(
+            state="normal"
+        )
+
+        messagebox.showerror(
+            "Analysis error",
+            f"The analysis failed:\n{error_message}"
+        )
+
+        self.analysis_start_time = None
 
 
 if __name__ == "__main__":
