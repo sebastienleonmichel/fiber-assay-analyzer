@@ -6,7 +6,6 @@ Hierarchical Statistical Analyzer
 GUI-based framework for:
 - stratified nonparametric testing
 - linear mixed-effects modeling
-- fixed-block linear modeling
 - replicate-aware statistical analysis
 - skewed biological datasets
 
@@ -18,7 +17,7 @@ Supports:
 
 Author: Sébastien Terreau
 Year: 2026
-Version: 2.2.11
+Version: 3.0.0
 """
 
 
@@ -32,13 +31,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from scipy.stats import rankdata, normaltest
+from scipy.stats import rankdata
 
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
 
 
-APP_VERSION = "v2.2.11"
+APP_VERSION = "v3.0.0"
 
 
 # ============================================================
@@ -59,7 +58,7 @@ def reshape_long(df_wide, col_to_group, col_to_repl):
             errors="coerce"
         ).dropna()
 
-        vals = vals[vals > 0]
+        vals = vals[np.isfinite(vals)]
 
         for v in vals:
 
@@ -76,22 +75,19 @@ def reshape_long(df_wide, col_to_group, col_to_repl):
 
 
 # ============================================================
-# REPLICATE-LEVEL SUMMARY UTILITIES
+# OUTPUT UTILITIES
 # ============================================================
 
-def add_multiple_testing_corrections(rows, raw_p):
+def add_holm_correction(rows, raw_p):
     """
-    Add Bonferroni, Holm, and Benjamini-Hochberg FDR-adjusted
-    p-values to a list of result rows.
+    Add Holm-adjusted p-values to a list of result rows.
     """
 
-    raw_p_array = np.array(raw_p)
+    raw_p_array = np.asarray(raw_p, dtype=float)
 
     valid = np.isfinite(raw_p_array)
 
     holm_adj = np.full(len(raw_p), np.nan)
-    bonf_adj = np.full(len(raw_p), np.nan)
-    fdr_adj = np.full(len(raw_p), np.nan)
 
     if np.sum(valid) > 0:
 
@@ -100,174 +96,50 @@ def add_multiple_testing_corrections(rows, raw_p):
             method="holm"
         )
 
-        _, p_bonf, _, _ = multipletests(
-            raw_p_array[valid],
-            method="bonferroni"
-        )
-
-        _, p_fdr, _, _ = multipletests(
-            raw_p_array[valid],
-            method="fdr_bh"
-        )
-
         holm_adj[valid] = p_holm
-        bonf_adj[valid] = p_bonf
-        fdr_adj[valid] = p_fdr
 
     for i in range(len(rows)):
 
-        rows[i]["p_bonferroni"] = bonf_adj[i]
         rows[i]["p_holm"] = holm_adj[i]
-        rows[i]["p_fdr_bh"] = fdr_adj[i]
 
     return rows
 
 
-def summarize_replicate_medians(
-    df_long,
-    log_transform=False
-):
+def significance_symbol(p_value):
     """
-    Collapse cell-level values into one median value per
-    group per biological replicate.
-
-    This avoids treating thousands of cells as independent
-    biological replicates when running replicate-level tests.
+    Return the plotting symbol corresponding to a Holm-adjusted p-value.
     """
 
-    df = df_long.copy()
+    if not np.isfinite(p_value):
+        return ""
 
-    if log_transform:
+    if p_value <= 0.0001:
+        return "****"
 
-        df["response"] = np.log(df["value"])
+    if p_value <= 0.001:
+        return "***"
 
-    else:
+    if p_value <= 0.01:
+        return "**"
 
-        df["response"] = df["value"]
+    if p_value <= 0.05:
+        return "*"
 
-    summary = (
-        df.groupby(
-            ["replicate_id", "group"],
-            as_index=False
-        )["response"]
-        .median()
-        .rename(columns={"response": "summary_value"})
+    return "ns"
+
+
+def add_significance_symbols(results):
+    """
+    Add Symbol as the final column, based only on p_holm.
+    """
+
+    results = results.copy()
+
+    results["Symbol"] = results["p_holm"].apply(
+        significance_symbol
     )
 
-    return summary
-
-
-
-def simplify_output_columns(results):
-    """
-    Keep the output table focused on contrast, method, effect size, and p-values.
-    """
-
-    columns_to_drop = [
-        "Summary",
-        "n_replicates",
-        "statistic",
-        "coefficient_B_minus_A"
-    ]
-
-    return results.drop(
-        columns=[
-            col for col in columns_to_drop
-            if col in results.columns
-        ]
-    )
-
-
-def run_column_residual_normality(df_wide):
-    """
-    Run D'Agostino-Pearson omnibus normality tests on residuals
-    from an intercept-only model for each original input column.
-
-    For each column:
-        residual = value - column mean
-
-    Decision threshold:
-        p < 0.05 -> non-normal residuals
-    """
-
-    rows = []
-
-    for col in df_wide.columns:
-
-        vals = pd.to_numeric(
-            df_wide[col],
-            errors="coerce"
-        ).dropna()
-
-        # Keep this consistent with the analyzer's main reshape step.
-        vals = vals[vals > 0]
-
-        n_values = int(len(vals))
-
-        if n_values > 0:
-
-            mean_value = float(vals.mean())
-            median_value = float(vals.median())
-
-        else:
-
-            mean_value = np.nan
-            median_value = np.nan
-
-        row = {
-            "Analysis": "Residual normality",
-            "Column": col,
-            "Contrast": "",
-            "Method": "D'Agostino-Pearson omnibus normality test",
-            "p_raw": np.nan,
-            "p_bonferroni": np.nan,
-            "p_holm": np.nan,
-            "p_fdr_bh": np.nan,
-            "Normality_decision": "not tested: n < 8",
-            "Median": median_value,
-            "Mean": mean_value
-        }
-
-        if n_values >= 8:
-
-            residuals = vals.to_numpy(dtype=float) - float(vals.mean())
-
-            try:
-
-                _, pval = normaltest(
-                    residuals,
-                    nan_policy="omit"
-                )
-
-                pval = float(pval)
-
-                row["p_raw"] = pval
-
-                if np.isfinite(pval):
-
-                    if pval < 0.05:
-
-                        row["Normality_decision"] = (
-                            "non-normal residuals"
-                        )
-
-                    else:
-
-                        row["Normality_decision"] = (
-                            "no evidence of non-normal residuals"
-                        )
-
-                else:
-
-                    row["Normality_decision"] = "not tested: invalid p-value"
-
-            except Exception as e:
-
-                row["Normality_decision"] = f"normality test failed: {e}"
-
-        rows.append(row)
-
-    return pd.DataFrame(rows)
+    return results
 
 
 # ============================================================
@@ -283,50 +155,6 @@ def mannwhitney_u(x, gA_mask):
     U = r[gA_mask].sum() - n1 * (n1 + 1) / 2
 
     return float(U)
-
-
-def cliffs_delta_from_values(values_A, values_B):
-    """
-    Compute Cliff's delta for two independent sets of values.
-
-    Sign convention:
-        positive delta -> group B tends to have higher values than group A
-        negative delta -> group B tends to have lower values than group A
-
-    Ties contribute 0 to the effect size.
-    """
-
-    values_A = np.asarray(values_A, dtype=float)
-    values_B = np.asarray(values_B, dtype=float)
-
-    values_A = values_A[np.isfinite(values_A)]
-    values_B = values_B[np.isfinite(values_B)]
-
-    nA = len(values_A)
-    nB = len(values_B)
-
-    if nA == 0 or nB == 0:
-
-        return np.nan
-
-    values = np.concatenate([values_A, values_B])
-
-    gA_mask = np.concatenate([
-        np.ones(nA, dtype=bool),
-        np.zeros(nB, dtype=bool)
-    ])
-
-    u_A = mannwhitney_u(
-        values,
-        gA_mask
-    )
-
-    # U_A estimates P(A > B) + 0.5 * P(A = B).
-    # Cliff's delta for B minus A is the opposite direction:
-    # P(B > A) - P(B < A).
-    delta_B_minus_A = 1 - (2 * u_A / (nA * nB))
-
-    return float(delta_B_minus_A)
 
 
 def stratified_cliffs_delta(
@@ -387,30 +215,6 @@ def stratified_cliffs_delta(
 
 
 
-def median_difference_from_values(values_A, values_B):
-    """
-    Compute median difference for a pairwise contrast.
-
-    Sign convention:
-        positive value -> group B median is higher than group A median
-        negative value -> group B median is lower than group A median
-    """
-
-    values_A = np.asarray(values_A, dtype=float)
-    values_B = np.asarray(values_B, dtype=float)
-
-    values_A = values_A[np.isfinite(values_A)]
-    values_B = values_B[np.isfinite(values_B)]
-
-    if len(values_A) == 0 or len(values_B) == 0:
-
-        return np.nan
-
-    return float(
-        np.median(values_B) - np.median(values_A)
-    )
-
-
 def stratified_median_difference(
     df_long,
     groupA,
@@ -462,6 +266,63 @@ def stratified_median_difference(
 
     return float(
         np.median(differences)
+    )
+
+
+def stratified_group_medians(
+    df_long,
+    groupA,
+    groupB
+):
+    """
+    Compute block-aware median values for the two groups in a pairwise
+    contrast.
+
+    For each complete biological replicate/block, the median of group A
+    and the median of group B are first calculated. The reported Median_A
+    and Median_B are then the medians of these replicate-level medians.
+    """
+
+    medians_A = []
+    medians_B = []
+
+    for _, sub in df_long.groupby("replicate_id"):
+
+        sub = sub[
+            sub["group"].isin([groupA, groupB])
+        ]
+
+        values_A = sub.loc[
+            sub["group"] == groupA,
+            "value"
+        ].to_numpy(dtype=float)
+
+        values_B = sub.loc[
+            sub["group"] == groupB,
+            "value"
+        ].to_numpy(dtype=float)
+
+        values_A = values_A[np.isfinite(values_A)]
+        values_B = values_B[np.isfinite(values_B)]
+
+        if len(values_A) == 0 or len(values_B) == 0:
+            continue
+
+        medians_A.append(
+            np.median(values_A)
+        )
+
+        medians_B.append(
+            np.median(values_B)
+        )
+
+    if len(medians_A) == 0 or len(medians_B) == 0:
+
+        return np.nan, np.nan
+
+    return (
+        float(np.median(medians_A)),
+        float(np.median(medians_B))
     )
 
 
@@ -709,21 +570,78 @@ def global_stratified_rank_test(
 # LMM
 # ============================================================
 
+LMM_RESPONSE_TRANSFORMS = (
+    "None",
+    "log2",
+    "ln",
+    "log10"
+)
+
+
+def transform_lmm_response(values, response_transform):
+    """
+    Transform an LMM response without altering values used by other tests.
+
+    Logarithmic transforms require strictly positive values. Nonpositive
+    observations are reported as an error rather than silently discarded or
+    replaced with a pseudocount.
+    """
+
+    if response_transform not in LMM_RESPONSE_TRANSFORMS:
+
+        allowed = ", ".join(LMM_RESPONSE_TRANSFORMS)
+
+        raise ValueError(
+            f"Unknown LMM response transform '{response_transform}'. "
+            f"Choose one of: {allowed}."
+        )
+
+    response = np.asarray(values, dtype=float)
+
+    if not np.all(np.isfinite(response)):
+
+        raise ValueError(
+            "LMM response contains non-finite values."
+        )
+
+    if response_transform == "None":
+
+        return response.copy()
+
+    nonpositive_count = int(np.sum(response <= 0))
+
+    if nonpositive_count > 0:
+
+        raise ValueError(
+            f"{response_transform} requires strictly positive response "
+            f"values; found {nonpositive_count} nonpositive value(s)"
+        )
+
+    transform_function = {
+        "log2": np.log2,
+        "ln": np.log,
+        "log10": np.log10
+    }[response_transform]
+
+    return transform_function(response)
+
+
 def run_lmm(
     df_long,
     contrasts,
-    log_transform=False
+    response_transform="None"
 ):
 
     df = df_long.copy()
 
-    if log_transform:
+    if response_transform not in LMM_RESPONSE_TRANSFORMS:
 
-        df["response"] = np.log(df["value"])
+        allowed = ", ".join(LMM_RESPONSE_TRANSFORMS)
 
-    else:
-
-        df["response"] = df["value"]
+        raise ValueError(
+            f"Unknown LMM response transform '{response_transform}'. "
+            f"Choose one of: {allowed}."
+        )
 
     rows = []
 
@@ -747,6 +665,12 @@ def run_lmm(
             B
         )
 
+        median_A, median_B = stratified_group_medians(
+            df,
+            A,
+            B
+        )
+
         # --------------------------------------------
         # REQUIRE MULTIPLE REPLICATES
         # --------------------------------------------
@@ -761,11 +685,20 @@ def run_lmm(
                 "Method":
                     "LMM failed: <2 replicate levels",
 
+                "Response_transform":
+                    response_transform,
+
                 "Cliffs_delta_B_minus_A":
                     delta,
 
                 "Median_difference_B_minus_A":
-                    median_diff
+                    median_diff,
+
+                "Median_A":
+                    median_A,
+
+                "Median_B":
+                    median_B
 
             })
 
@@ -780,6 +713,11 @@ def run_lmm(
 
         try:
 
+            sub["response"] = transform_lmm_response(
+                sub["value"],
+                response_transform
+            )
+
             model = smf.mixedlm(
                 "response ~ group",
                 data=sub,
@@ -791,10 +729,6 @@ def run_lmm(
             # ----------------------------------------
             # ROBUST EXTRACTION
             # ----------------------------------------
-
-            beta = float(
-                fit.params.iloc[1]
-            )
 
             pval = float(
                 fit.pvalues.iloc[1]
@@ -810,11 +744,20 @@ def run_lmm(
                 "Method":
                     "Linear Mixed Model",
 
+                "Response_transform":
+                    response_transform,
+
                 "Cliffs_delta_B_minus_A":
                     delta,
 
                 "Median_difference_B_minus_A":
                     median_diff,
+
+                "Median_A":
+                    median_A,
+
+                "Median_B":
+                    median_B,
 
                 "p_raw":
                     pval
@@ -831,125 +774,8 @@ def run_lmm(
                 "Method":
                     f"LMM failed: {e}",
 
-                "Cliffs_delta_B_minus_A":
-                    delta,
-
-                "Median_difference_B_minus_A":
-                    median_diff
-
-            })
-
-            raw_p.append(np.nan)
-
-    # ========================================================
-    # MULTIPLE TESTING CORRECTIONS
-    # ========================================================
-
-    raw_p_array = np.array(raw_p)
-
-    valid = np.isfinite(raw_p_array)
-
-    holm_adj = np.full(len(raw_p), np.nan)
-    bonf_adj = np.full(len(raw_p), np.nan)
-    fdr_adj = np.full(len(raw_p), np.nan)
-
-    if np.sum(valid) > 0:
-
-        _, p_holm, _, _ = multipletests(
-            raw_p_array[valid],
-            method="holm"
-        )
-
-        _, p_bonf, _, _ = multipletests(
-            raw_p_array[valid],
-            method="bonferroni"
-        )
-
-        _, p_fdr, _, _ = multipletests(
-            raw_p_array[valid],
-            method="fdr_bh"
-        )
-
-        holm_adj[valid] = p_holm
-        bonf_adj[valid] = p_bonf
-        fdr_adj[valid] = p_fdr
-
-    for i in range(len(rows)):
-
-        rows[i]["p_bonferroni"] = bonf_adj[i]
-        rows[i]["p_holm"] = holm_adj[i]
-        rows[i]["p_fdr_bh"] = fdr_adj[i]
-
-    return pd.DataFrame(rows)
-
-
-
-# ============================================================
-# FIXED-BLOCK LINEAR MODEL ON REPLICATE MEDIANS
-# ============================================================
-
-def run_fixed_block_lm(
-    df_long,
-    contrasts,
-    log_transform=False
-):
-    """
-    Run a fixed-block linear model on replicate-level medians.
-
-    Model for each pairwise contrast:
-        summary_value ~ group_code + C(replicate_id)
-
-    Here replicate_id is treated as a fixed blocking factor
-    instead of a random effect.
-    """
-
-    summary = summarize_replicate_medians(
-        df_long,
-        log_transform=log_transform
-    )
-
-    rows = []
-
-    raw_p = []
-
-    for A, B in contrasts:
-
-        sub = summary[
-            summary["group"].isin([A, B])
-        ].copy()
-
-        complete_replicates = (
-            sub.groupby("replicate_id")["group"]
-            .nunique()
-        )
-
-        complete_replicates = complete_replicates[
-            complete_replicates == 2
-        ].index
-
-        sub = sub[
-            sub["replicate_id"].isin(complete_replicates)
-        ].copy()
-
-        delta = cliffs_delta_from_values(
-            sub.loc[sub["group"] == A, "summary_value"],
-            sub.loc[sub["group"] == B, "summary_value"]
-        )
-
-        median_diff = median_difference_from_values(
-            sub.loc[sub["group"] == A, "summary_value"],
-            sub.loc[sub["group"] == B, "summary_value"]
-        )
-
-        if sub["replicate_id"].nunique() < 2:
-
-            rows.append({
-
-                "Contrast":
-                    f"{A} vs {B}",
-
-                "Method":
-                    "Fixed-block LM failed: <2 complete replicate blocks",
+                "Response_transform":
+                    response_transform,
 
                 "Cliffs_delta_B_minus_A":
                     delta,
@@ -957,96 +783,17 @@ def run_fixed_block_lm(
                 "Median_difference_B_minus_A":
                     median_diff,
 
-                "Summary":
-                    "replicate median",
+                "Median_A":
+                    median_A,
 
-                "n_replicates":
-                    sub["replicate_id"].nunique()
-
-            })
-
-            raw_p.append(np.nan)
-
-            continue
-
-        sub["group_code"] = (
-            sub["group"] == B
-        ).astype(int)
-
-        try:
-
-            model = smf.ols(
-                "summary_value ~ group_code + C(replicate_id)",
-                data=sub
-            )
-
-            fit = model.fit()
-
-            beta = float(
-                fit.params["group_code"]
-            )
-
-            pval = float(
-                fit.pvalues["group_code"]
-            )
-
-            rows.append({
-
-                "Contrast":
-                    f"{A} vs {B}",
-
-                "Method":
-                    "Fixed-block linear model",
-
-                "Cliffs_delta_B_minus_A":
-                    delta,
-
-                "Median_difference_B_minus_A":
-                    median_diff,
-
-                "Summary":
-                    "replicate median",
-
-                "n_replicates":
-                    sub["replicate_id"].nunique(),
-
-                "coefficient_B_minus_A":
-                    beta,
-
-                "p_raw":
-                    pval
-
-            })
-
-            raw_p.append(pval)
-
-        except Exception as e:
-
-            rows.append({
-
-                "Contrast":
-                    f"{A} vs {B}",
-
-                "Method":
-                    f"Fixed-block LM failed: {e}",
-
-                "Cliffs_delta_B_minus_A":
-                    delta,
-
-                "Median_difference_B_minus_A":
-                    median_diff,
-
-                "Summary":
-                    "replicate median",
-
-                "n_replicates":
-                    sub["replicate_id"].nunique()
+                "Median_B":
+                    median_B
 
             })
 
             raw_p.append(np.nan)
 
-    rows = add_multiple_testing_corrections(
+    rows = add_holm_correction(
         rows,
         raw_p
     )
@@ -1253,13 +1000,14 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
         self.engine_vars = {
             "Stratified Wilcoxon": tk.BooleanVar(value=True),
-            "Linear Mixed Model": tk.BooleanVar(value=True),
-            "Fixed-block linear model": tk.BooleanVar(value=False)
+            "Linear Mixed Model": tk.BooleanVar(value=True)
         }
 
-        self.log_var = tk.BooleanVar(
-            value=False
+        self.lmm_response_transform_var = tk.StringVar(
+            value="None"
         )
+
+        self.lmm_transform_buttons = []
 
         self.status_var = tk.StringVar(
             value="Ready"
@@ -1555,22 +1303,77 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
         for engine_name, engine_var in self.engine_vars.items():
 
-            ttk.Checkbutton(
+            engine_button = ttk.Checkbutton(
                 frm,
                 text=engine_name,
                 variable=engine_var
-            ).pack(anchor="w", padx=40, pady=2)
+            )
 
-        ttk.Separator(
-            frm,
-            orient="horizontal"
-        ).pack(fill="x", padx=20, pady=20)
+            if engine_name == "Linear Mixed Model":
 
-        ttk.Checkbutton(
-            frm,
-            text="Log-transform values",
-            variable=self.log_var
-        ).pack(anchor="w", padx=20, pady=5)
+                engine_button.configure(
+                    command=self._update_lmm_transform_state
+                )
+
+            engine_button.pack(anchor="w", padx=40, pady=2)
+
+            if engine_name == "Linear Mixed Model":
+
+                transform_frame = ttk.Frame(frm)
+
+                transform_frame.pack(
+                    anchor="w",
+                    padx=60,
+                    pady=(4, 2)
+                )
+
+                ttk.Label(
+                    transform_frame,
+                    text="Transform response before linear models:"
+                ).pack(side="left", padx=(0, 10))
+
+                for transform_name in LMM_RESPONSE_TRANSFORMS:
+
+                    transform_button = ttk.Radiobutton(
+                        transform_frame,
+                        text=transform_name,
+                        value=transform_name,
+                        variable=self.lmm_response_transform_var
+                    )
+
+                    transform_button.pack(
+                        side="left",
+                        padx=(0, 10)
+                    )
+
+                    self.lmm_transform_buttons.append(
+                        transform_button
+                    )
+
+                ttk.Label(
+                    frm,
+                    text=(
+                        "Used only by the Linear Mixed Model. Choose None "
+                        "if the imported response is already transformed."
+                    )
+                ).pack(anchor="w", padx=60, pady=(0, 5))
+
+        self._update_lmm_transform_state()
+
+
+    def _update_lmm_transform_state(self):
+
+        state = (
+            "normal"
+            if self.engine_vars["Linear Mixed Model"].get()
+            else "disabled"
+        )
+
+        for transform_button in self.lmm_transform_buttons:
+
+            transform_button.configure(
+                state=state
+            )
 
 
     def build_run(self):
@@ -1811,7 +1614,7 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
         # This keeps the background analysis isolated from GUI state.
         df_copy = self.df.copy()
         input_path = self.input_path
-        log_transform = self.log_var.get()
+        lmm_response_transform = self.lmm_response_transform_var.get()
 
         self.analysis_thread = threading.Thread(
             target=self._analysis_worker,
@@ -1821,7 +1624,7 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                 "col_to_repl": col_to_repl,
                 "contrasts": contrasts,
                 "selected_engines": selected_engines,
-                "log_transform": log_transform,
+                "lmm_response_transform": lmm_response_transform,
                 "input_path": input_path,
             },
             daemon=True
@@ -1879,7 +1682,7 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
         col_to_repl,
         contrasts,
         selected_engines,
-        log_transform,
+        lmm_response_transform,
         input_path
     ):
         """
@@ -1947,16 +1750,16 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                     "Median_difference_B_minus_A":
                         np.nan,
 
+                    "Median_A":
+                        np.nan,
+
+                    "Median_B":
+                        np.nan,
+
                     "p_raw":
                         global_p,
 
-                    "p_bonferroni":
-                        np.nan,
-
                     "p_holm":
-                        np.nan,
-
-                    "p_fdr_bh":
                         np.nan
 
                 })
@@ -1991,6 +1794,12 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                         B
                     )
 
+                    median_A, median_B = stratified_group_medians(
+                        df_long,
+                        A,
+                        B
+                    )
+
                     raw_p.append(p)
 
                     rows.append({
@@ -2007,6 +1816,12 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                         "Median_difference_B_minus_A":
                             median_diff,
 
+                        "Median_A":
+                            median_A,
+
+                        "Median_B":
+                            median_B,
+
                         "p_raw":
                             p
 
@@ -2014,7 +1829,7 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
                 posthoc_rows = rows[1:]
 
-                posthoc_rows = add_multiple_testing_corrections(
+                posthoc_rows = add_holm_correction(
                     posthoc_rows,
                     raw_p
                 )
@@ -2035,92 +1850,44 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
 
                 self.worker_queue.put((
                     "status",
-                    "Running Linear Mixed Model..."
+                    "Running Linear Mixed Model "
+                    f"({lmm_response_transform} response)..."
                 ))
 
                 lmm_df = run_lmm(
                     df_long,
                     contrasts,
-                    log_transform=log_transform
+                    response_transform=lmm_response_transform
                 )
 
                 all_results.append(lmm_df)
-
-            # ====================================================
-            # FIXED-BLOCK LINEAR MODEL
-            # ====================================================
-
-            if "Fixed-block linear model" in selected_engines:
-
-                self.worker_queue.put((
-                    "status",
-                    "Running Fixed-block linear model..."
-                ))
-
-                fixed_block_df = run_fixed_block_lm(
-                    df_long,
-                    contrasts,
-                    log_transform=log_transform
-                )
-
-                all_results.append(fixed_block_df)
 
             results = pd.concat(
                 all_results,
                 ignore_index=True
             )
 
-            results = simplify_output_columns(results)
+            if "Response_transform" not in results.columns:
 
-            results.insert(
-                0,
-                "Analysis",
-                "Contrast test"
-            )
+                results["Response_transform"] = "Not applicable"
 
-            if "Column" not in results.columns:
+            else:
 
-                results.insert(
-                    1,
-                    "Column",
-                    ""
+                results["Response_transform"] = (
+                    results["Response_transform"]
+                    .fillna("Not applicable")
                 )
 
-            if "Normality_decision" not in results.columns:
-
-                results["Normality_decision"] = ""
-
-            self.worker_queue.put((
-                "status",
-                "Running residual normality tests..."
-            ))
-
-            normality_df = run_column_residual_normality(
-                df_wide
-            )
-
-            results = pd.concat(
-                [
-                    results,
-                    normality_df
-                ],
-                ignore_index=True
-            )
-
             output_columns = [
-                "Analysis",
-                "Column",
                 "Contrast",
                 "Method",
+                "Response_transform",
                 "p_raw",
-                "p_bonferroni",
                 "p_holm",
-                "p_fdr_bh",
-                "Normality_decision",
                 "Cliffs_delta_B_minus_A",
-                "Median_difference_B_minus_A",
-                "Median",
-                "Mean"
+                "Median_A",
+                "Median_B",
+                "Median_difference_B_minus_A"
             ]
 
             for col in output_columns:
@@ -2130,6 +1897,10 @@ class HierarchicalStatisticalAnalyzerGUI(tk.Tk):
                     results[col] = np.nan
 
             results = results[output_columns]
+
+            results = add_significance_symbols(
+                results
+            )
 
             if input_path is not None:
 
