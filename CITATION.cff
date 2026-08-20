@@ -1,33 +1,25 @@
 cff-version: 1.2.0
-
 message: "If you use this software, please cite it as below."
-
 title: "Hierarchical Statistical Analyzer"
-
 type: software
-
 authors:
   - family-names: "Terreau"
     given-names: "Sébastien"
-
-version: "2.0.0"
-
+version: "3.0.0"
 doi: 10.5281/zenodo.19500564
-
 repository-code: "https://github.com/sebastienleonmichel/hierarchical-statistical-analyzer"
-
 license: "MIT"
-
 abstract: >-
   GUI-based Python framework for hierarchical and replicate-aware
-  statistical analysis of biological datasets using stratified
-  nonparametric testing and linear mixed-effects models.
-
+  statistical analysis of biological datasets using global and pairwise
+  stratified rank permutation tests, block-aware effect summaries, and
+  linear mixed-effects models.
 keywords:
   - "hierarchical statistics"
   - "linear mixed model"
   - "stratified Wilcoxon"
   - "van Elteren"
+  - "permutation test"
   - "biostatistics"
   - "replicate-aware analysis"
   - "mixed-effects modeling"
